@@ -1,0 +1,77 @@
+name: Test Pull Request (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      lint-warnings-as-errors:
+        description: 'Pass --warnings-as-errors to web-ext lint'
+        type: boolean
+        default: false
+      validate-versions:
+        description: 'Run extension-validate-versions step'
+        type: boolean
+        default: true
+      security-audit-strict:
+        description: 'Hard-fail on security audit (vs continue-on-error)'
+        type: boolean
+        default: false
+      upload-coverage:
+        description: 'Upload coverage to Codecov'
+        type: boolean
+        default: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm ci --ignore-scripts
+
+    - name: Validate version consistency
+      if: inputs.validate-versions
+      run: npx extension-validate-versions
+
+    - name: Security audit (strict)
+      if: inputs.security-audit-strict
+      run: |
+        npm audit --audit-level=moderate || {
+          echo "::warning::Security vulnerabilities found! Run 'npm audit' locally for details."
+          npm audit --audit-level=moderate --json > audit-results.json
+          exit 1
+        }
+
+    - name: Security audit (lenient)
+      if: ${{ !inputs.security-audit-strict }}
+      continue-on-error: true
+      run: |
+        npm audit --audit-level=moderate || {
+          echo "::warning::Security vulnerabilities found! Run 'npm audit' locally for details."
+        }
+
+    - name: Run linting
+      run: |
+        if [ "${{ inputs.lint-warnings-as-errors }}" == "true" ]; then
+          npx web-ext lint --source-dir=src --warnings-as-errors
+        else
+          npx web-ext lint --source-dir=src
+        fi
+
+    - name: Run tests with coverage
+      run: npm run test:ci
+
+    - name: Upload coverage reports
+      if: inputs.upload-coverage
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage/lcov.info
+        flags: unittests
+        fail_ci_if_error: false

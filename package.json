@@ -1,0 +1,15 @@
+{
+  "name": "extension-workflows",
+  "version": "1.0.0",
+  "description": "Shared CI/CD workflows and tools for browser extensions",
+  "bin": {
+    "extension-version-bump": "./tools/version-bump.js",
+    "extension-validate-versions": "./tools/validate-versions.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/evanwon/extension-workflows.git"
+  },
+  "author": "Evan Wondrasek",
+  "license": "MIT"
+}
