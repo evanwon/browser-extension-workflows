@@ -1,5 +1,5 @@
 {
-  "name": "extension-workflows",
+  "name": "browser-extension-workflows",
   "version": "1.0.0",
   "description": "Shared CI/CD workflows and tools for browser extensions",
   "bin": {
