@@ -63,10 +63,36 @@ on:
         description: 'Optional AMO submission notes (from workflow_dispatch passthrough)'
         type: string
         default: ''
+      chrome-enabled:
+        description: 'Enable Chrome build, validation, and packaging'
+        type: boolean
+        default: false
+      chrome-build-dir:
+        description: 'Where Chrome build output lives'
+        type: string
+        default: 'build/chrome'
+      cws-submission-enabled:
+        description: 'Enable Chrome Web Store submission (mirrors amo-submission-enabled pattern)'
+        type: boolean
+        default: false
+      cws-extension-id:
+        description: 'Chrome Web Store extension ID'
+        type: string
+        default: ''
+      chrome-min-version:
+        description: 'Minimum Chrome version for release notes footer'
+        type: string
+        default: '102+'
     secrets:
       AMO_API_KEY:
         required: false
       AMO_API_SECRET:
+        required: false
+      CWS_CLIENT_ID:
+        required: false
+      CWS_CLIENT_SECRET:
+        required: false
+      CWS_REFRESH_TOKEN:
         required: false
 
 jobs:
@@ -118,7 +144,11 @@ jobs:
       run: npm run test:ci
 
     - name: Install build tools
-      run: npm install -g web-ext@latest --ignore-scripts
+      run: |
+        npm install -g web-ext@latest --ignore-scripts
+        if [ "${{ inputs.chrome-enabled }}" == "true" ]; then
+          npm install -g chrome-webstore-upload-cli@latest --ignore-scripts
+        fi
 
     - name: Validate manifest
       run: |
@@ -296,6 +326,56 @@ jobs:
         echo "filepath=$filepath" >> $GITHUB_OUTPUT
         echo "Found Firefox artifact: $filename (signed: $([ -d dist-signed ] && echo 'yes' || echo 'no'))"
 
+    - name: Chrome - Build extension
+      if: inputs.chrome-enabled
+      run: npm run build:chrome
+
+    - name: Chrome - Validate build
+      if: inputs.chrome-enabled
+      run: |
+        test -f ${{ inputs.chrome-build-dir }}/service-worker.js
+        test -f ${{ inputs.chrome-build-dir }}/manifest.json
+        node -e "
+          const m = JSON.parse(require('fs').readFileSync('${{ inputs.chrome-build-dir }}/manifest.json', 'utf8'));
+          if (m.manifest_version !== 3) throw new Error('Chrome manifest must be MV3');
+          if (!m.background.service_worker) throw new Error('Chrome must use service worker');
+          console.log('Chrome build validated: MV3 with service worker');
+        "
+
+    - name: Chrome - Create ZIP
+      if: inputs.chrome-enabled
+      run: |
+        EXT_NAME="${{ inputs.extension-name }}"
+        VERSION="${{ steps.get_version.outputs.version }}"
+        mkdir -p dist
+        cd ${{ inputs.chrome-build-dir }}
+        zip -r "../../dist/${EXT_NAME}-chrome-v${VERSION}.zip" .
+        cd ../..
+        echo "chrome_zip=dist/${EXT_NAME}-chrome-v${VERSION}.zip" >> $GITHUB_ENV
+
+    - name: Chrome - Submit to Chrome Web Store
+      if: >
+        inputs.chrome-enabled &&
+        inputs.cws-submission-enabled &&
+        steps.release_type.outputs.is_prerelease == 'false'
+      env:
+        CWS_CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
+        CWS_CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
+        CWS_REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
+      run: |
+        if [[ -z "$CWS_CLIENT_ID" || -z "$CWS_CLIENT_SECRET" || -z "$CWS_REFRESH_TOKEN" ]]; then
+          echo "Chrome Web Store credentials not configured. Skipping submission."
+          exit 0
+        fi
+        EXT_NAME="${{ inputs.extension-name }}"
+        VERSION="${{ steps.get_version.outputs.version }}"
+        chrome-webstore-upload upload \
+          --source "dist/${EXT_NAME}-chrome-v${VERSION}.zip" \
+          --extension-id "${{ inputs.cws-extension-id }}" \
+          --client-id "$CWS_CLIENT_ID" \
+          --client-secret "$CWS_CLIENT_SECRET" \
+          --refresh-token "$CWS_REFRESH_TOKEN"
+
     - name: Generate changelog
       id: changelog
       run: |
@@ -362,7 +442,7 @@ jobs:
           echo "EOF" >> $GITHUB_OUTPUT
         fi
 
-    - name: Create Release with Asset (Firefox)
+    - name: Create Release with Assets
       if: matrix.browser == 'firefox' && (github.event_name == 'push' || inputs.create-release)
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -441,6 +521,22 @@ jobs:
         NOTES_EOF
         fi
 
+        # Add Chrome installation instructions if chrome-enabled
+        if [ "${{ inputs.chrome-enabled }}" == "true" ]; then
+          CHROME_MIN="${{ inputs.chrome-min-version }}"
+          cat >> release_notes.md << 'NOTES_EOF'
+
+        ## Chrome Installation
+
+        1. Download the `.zip` file from the **Assets** section below
+        2. Unzip to a folder on your computer
+        3. Open `chrome://extensions/`
+        4. Enable "Developer mode" (toggle in top right)
+        5. Click "Load unpacked" and select the unzipped folder
+
+        NOTES_EOF
+        fi
+
         # Add pre-release notice if applicable
         ISSUES_URL="${{ inputs.issues-url }}"
         if [ "${{ steps.release_type.outputs.is_prerelease }}" == "true" ]; then
@@ -462,6 +558,8 @@ jobs:
         FF_MIN="${{ inputs.firefox-min-version }}"
         PERMISSIONS="${{ inputs.permissions-description }}"
 
+        CHROME_MIN="${{ inputs.chrome-min-version }}"
+
         cat >> release_notes.md << NOTES_EOF
 
         ## What's New
@@ -470,6 +568,13 @@ jobs:
         ---
 
         **Firefox Requirements:** Version ${FF_MIN}
+        NOTES_EOF
+
+        if [ "${{ inputs.chrome-enabled }}" == "true" ]; then
+          echo "**Chrome Requirements:** Version ${CHROME_MIN}" >> release_notes.md
+        fi
+
+        cat >> release_notes.md << NOTES_EOF
         **Permissions:** ${PERMISSIONS}
         NOTES_EOF
 
@@ -482,19 +587,25 @@ jobs:
           RELEASE_TITLE="${DISPLAY_NAME} v${VERSION}"
         fi
 
-        # Create release with asset using GitHub CLI
+        # Collect release assets
+        ASSETS=("$xpi_file")
+        if [ "${{ inputs.chrome-enabled }}" == "true" ] && [ -f "${{ env.chrome_zip }}" ]; then
+          ASSETS+=("${{ env.chrome_zip }}")
+        fi
+
+        # Create release with assets using GitHub CLI
         if [[ "${{ github.event_name }}" == "push" ]]; then
           gh release create "${{ github.ref_name }}" \
             --title "$RELEASE_TITLE" \
             --notes-file release_notes.md \
             $RELEASE_FLAGS \
-            "$xpi_file"
+            "${ASSETS[@]}"
         else
           gh release create "v${VERSION}-manual-$(date +%Y%m%d%H%M%S)" \
             --title "$RELEASE_TITLE (Manual Build)" \
             --notes-file release_notes.md \
             --prerelease \
-            "$xpi_file"
+            "${ASSETS[@]}"
         fi
 
     - name: Build Summary
@@ -503,28 +614,34 @@ jobs:
         VERSION="${{ steps.get_version.outputs.version }}"
         SIGNED="${{ steps.get_firefox_artifact.outputs.signed }}"
 
-        echo "${{ matrix.browser }} build completed for v${VERSION}!"
-        if [ "${{ matrix.browser }}" == "firefox" ]; then
-          if [ "$SIGNED" == "amo" ]; then
-            echo "Firefox Asset: ${EXT_NAME}-firefox-v${VERSION}-amo.xpi (Submitted to AMO)"
-            echo "AMO Status: Submitted for review on addons.mozilla.org"
-          elif [ "$SIGNED" == "true" ]; then
-            echo "Firefox Asset: ${EXT_NAME}-firefox-v${VERSION}-signed.xpi (SIGNED for self-distribution)"
-          else
-            echo "Firefox Asset: ${EXT_NAME}-firefox-v${VERSION}.xpi (unsigned)"
-          fi
-          if [[ "${{ github.event_name }}" == "push" || "${{ inputs.create-release }}" == "true" ]]; then
-            echo "Release URL: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}"
-          else
-            echo "Build artifacts available in workflow run"
-          fi
+        echo "Build completed for v${VERSION}!"
+
+        # Firefox summary
+        if [ "$SIGNED" == "amo" ]; then
+          echo "Firefox Asset: ${EXT_NAME}-firefox-v${VERSION}-amo.xpi (Submitted to AMO)"
+          echo "AMO Status: Submitted for review on addons.mozilla.org"
+        elif [ "$SIGNED" == "true" ]; then
+          echo "Firefox Asset: ${EXT_NAME}-firefox-v${VERSION}-signed.xpi (SIGNED for self-distribution)"
+        else
+          echo "Firefox Asset: ${EXT_NAME}-firefox-v${VERSION}.xpi (unsigned)"
+        fi
+
+        # Chrome summary
+        if [ "${{ inputs.chrome-enabled }}" == "true" ]; then
+          echo "Chrome Asset: ${EXT_NAME}-chrome-v${VERSION}.zip"
+        fi
+
+        if [[ "${{ github.event_name }}" == "push" || "${{ inputs.create-release }}" == "true" ]]; then
+          echo "Release URL: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}"
+        else
+          echo "Build artifacts available in workflow run"
         fi
 
     - name: Upload artifacts (manual builds)
       if: github.event_name == 'workflow_dispatch' && !inputs.create-release
       uses: actions/upload-artifact@v4
       with:
-        name: firefox-extension-v${{ steps.get_version.outputs.version }}
+        name: extension-v${{ steps.get_version.outputs.version }}
         path: |
           dist/*.zip
           dist/*.xpi

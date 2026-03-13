@@ -19,6 +19,10 @@ on:
         description: 'Upload coverage to Codecov'
         type: boolean
         default: false
+      chrome-enabled:
+        description: 'Enable Chrome build validation in PR checks'
+        type: boolean
+        default: false
 
 jobs:
   test:
@@ -67,6 +71,21 @@ jobs:
 
     - name: Run tests with coverage
       run: npm run test:ci
+
+    - name: Chrome - Build extension
+      if: inputs.chrome-enabled
+      run: npm run build:chrome
+
+    - name: Chrome - Validate build
+      if: inputs.chrome-enabled
+      run: |
+        test -f build/chrome/service-worker.js
+        test -f build/chrome/manifest.json
+        node -e "
+          const m = JSON.parse(require('fs').readFileSync('build/chrome/manifest.json', 'utf8'));
+          if (m.manifest_version !== 3) throw new Error('Not MV3');
+          console.log('Chrome build validated');
+        "
 
     - name: Upload coverage reports
       if: inputs.upload-coverage
