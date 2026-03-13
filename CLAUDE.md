@@ -12,7 +12,7 @@ This repo has no test suite or build step. Changes are released by moving the fl
 ## Project Structure
 
 ```
-extension-workflows/
+browser-extension-workflows/
 ├── .github/workflows/
 │   ├── build-release.yml       # Reusable: build, sign, AMO submit, GitHub release
 │   └── test-pr.yml             # Reusable: test, lint, audit for PRs
@@ -27,7 +27,7 @@ There are only 4 functional files. The workflows are GitHub Actions YAML; the to
 
 ## How Consumers Use This
 
-Consumer extensions install this as a devDependency (`github:evanwon/extension-workflows`) and set up:
+Consumer extensions install this as a devDependency (`github:evanwon/browser-extension-workflows`) and set up:
 
 1. **npm scripts** — `version:bump` → `extension-version-bump`, `version:check` → `extension-validate-versions`, `test:ci` → their test runner
 2. **Thin workflow files** — `.github/workflows/test-pr.yml` and `build-release.yml` that `uses:` the reusable workflows from this repo at `@v1`
@@ -71,14 +71,15 @@ Both CLI tools enforce this encoding. `version-bump.js` computes it automaticall
 - **Security audit** — build-release hard-fails on production vulns (`--omit=dev`) but only warns on dev-only vulns. test-pr has a configurable strict mode
 - **Browser matrix** — `browser: [firefox]` is set up for future Chrome expansion
 
-## Chrome Support (Coming Soon)
+## Chrome Support
 
-Chrome support is an active priority. Groundwork is already in place:
+Chrome support is implemented as opt-in via `chrome-enabled: true` in both workflows:
 
-- `validate-versions.js` already handles Chrome manifest templates at `manifests/chrome/manifest.json` with `__VERSION__` placeholders
-- The build workflow matrix has `browser: [firefox]` — designed to expand to `[firefox, chrome]`
-- Consumer extensions should avoid Firefox-only APIs where possible
-- Remaining work: add Chrome build/package steps to `build-release.yml`, Chrome Web Store submission support
+- `validate-versions.js` handles Chrome manifest templates at `manifests/chrome/manifest.json` with `__VERSION__` placeholders
+- `build-release.yml` adds Chrome build, MV3 validation, ZIP packaging, Chrome Web Store submission, and dual-asset releases
+- `test-pr.yml` adds Chrome build and MV3 validation steps
+- All Chrome steps are gated by `if: inputs.chrome-enabled` — repos that don't opt in are completely unaffected
+- Consumer extensions provide their own `build:chrome` npm script (e.g., `node tools/build.js --browser=chrome`)
 
 ## Releasing Changes
 

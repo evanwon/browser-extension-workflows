@@ -8,7 +8,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/evanwon/extension-workflows.git"
+    "url": "git+https://github.com/evanwon/browser-extension-workflows.git"
   },
   "author": "Evan Wondrasek",
   "license": "MIT"

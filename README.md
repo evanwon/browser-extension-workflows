@@ -1,18 +1,18 @@
-# Extension Workflows
+# Browser Extension Workflows
 
 Shared CI/CD workflows and versioning tools for browser extensions. Provides two things:
 
 1. **Reusable GitHub Actions workflows** for PR validation and build/release (test, lint, build, sign, AMO submission, GitHub releases)
 2. **CLI tools** for version management (`extension-version-bump`, `extension-validate-versions`)
 
-Currently supports Firefox. Chrome support is coming soon — the version tooling already handles Chrome manifests, and the build workflow matrix is designed to expand to multiple browsers.
+Supports Firefox and Chrome. Chrome support is opt-in via `chrome-enabled: true` — repos that don't set it are completely unaffected.
 
 ## Getting Started
 
 ### 1. Install the package
 
 ```bash
-npm install github:evanwon/extension-workflows --save-dev
+npm install github:evanwon/browser-extension-workflows --save-dev
 ```
 
 ### 2. Add npm scripts to your `package.json`
@@ -44,12 +44,13 @@ on:
 
 jobs:
   test:
-    uses: evanwon/extension-workflows/.github/workflows/test-pr.yml@v1
+    uses: evanwon/browser-extension-workflows/.github/workflows/test-pr.yml@v1
     with:
       lint-warnings-as-errors: false
       validate-versions: true
       security-audit-strict: false
       upload-coverage: false
+      # chrome-enabled: true  # Uncomment to enable Chrome build validation
 ```
 
 #### `.github/workflows/build-release.yml`
@@ -85,7 +86,7 @@ permissions:
 
 jobs:
   build:
-    uses: evanwon/extension-workflows/.github/workflows/build-release.yml@v1
+    uses: evanwon/browser-extension-workflows/.github/workflows/build-release.yml@v1
     with:
       extension-name: my-extension
       extension-display-name: "My Extension"
@@ -101,6 +102,11 @@ jobs:
       create-release: ${{ github.event.inputs.create_release == 'true' }}
       submit-to-amo: ${{ github.event.inputs.submit_to_amo == 'true' }}
       channel: ${{ github.event.inputs.channel || 'listed' }}
+      # Chrome support (opt-in):
+      # chrome-enabled: true
+      # cws-submission-enabled: ${{ vars.CWS_SUBMISSION_ENABLED == 'true' }}
+      # cws-extension-id: ${{ vars.CWS_EXTENSION_ID }}
+      # chrome-min-version: "102+"
     secrets: inherit
 ```
 
@@ -117,23 +123,28 @@ Your `src/manifest.json` must include both `version` and `version_name` fields:
 
 The `version:bump` tool manages both fields automatically.
 
-### 5. Configure GitHub secrets (optional, for AMO)
+### 5. Configure GitHub secrets (optional)
 
-If you want automated AMO signing and submission:
+For automated AMO signing/submission and/or Chrome Web Store uploads:
 
 | Type | Name | Description |
 |------|------|-------------|
-| Secret | `AMO_API_KEY` | Your AMO API issuer ID |
-| Secret | `AMO_API_SECRET` | Your AMO API secret |
+| Secret | `AMO_API_KEY` | AMO API issuer ID (Firefox) |
+| Secret | `AMO_API_SECRET` | AMO API secret (Firefox) |
 | Variable | `AMO_SUBMISSION_ENABLED` | Set to `true` to auto-submit stable tags to AMO listed channel |
+| Secret | `CWS_CLIENT_ID` | Chrome Web Store API client ID |
+| Secret | `CWS_CLIENT_SECRET` | Chrome Web Store API client secret |
+| Secret | `CWS_REFRESH_TOKEN` | Chrome Web Store API refresh token |
+| Variable | `CWS_SUBMISSION_ENABLED` | Set to `true` to enable CWS uploads on stable tags |
+| Variable | `CWS_EXTENSION_ID` | Chrome Web Store extension ID |
 
-Without AMO credentials, builds still run — you just get unsigned `.xpi` files.
+Without credentials, builds still run — you just get unsigned artifacts.
 
 ## Conventions
 
 This package is opinionated. It assumes:
 
-- **Firefox supported, Chrome coming soon** — builds currently use `web-ext` and AMO signing; Chrome build steps are next
+- **Firefox and Chrome** — Firefox uses `web-ext` and AMO signing; Chrome build/validation/CWS submission is opt-in via `chrome-enabled: true`
 - **Source in `src/`** — your extension source lives in `src/`, including `src/manifest.json`
 - **Manifest V2 or V3** — configurable via `manifest-version` input (default: 3)
 - **`npm ci --ignore-scripts`** — dependencies are installed without running lifecycle scripts (security)
@@ -217,6 +228,7 @@ Runs on PRs. Steps: checkout, install, validate versions, security audit, web-ex
 | `validate-versions` | boolean | `true` | Run `extension-validate-versions` |
 | `security-audit-strict` | boolean | `false` | Fail on `npm audit` findings (vs. warn-only) |
 | `upload-coverage` | boolean | `false` | Upload coverage to Codecov |
+| `chrome-enabled` | boolean | `false` | Enable Chrome build validation in PR checks |
 
 ### build-release.yml
 
@@ -239,15 +251,24 @@ Runs on `v*` tags or manual dispatch. Steps: checkout, install, validate, audit,
 | `submit-to-amo` | boolean | no | `false` | Submit to AMO (for `workflow_dispatch`) |
 | `channel` | string | no | `'listed'` | AMO channel (for `workflow_dispatch`) |
 | `version-notes` | string | no | `''` | Optional AMO submission notes |
+| `chrome-enabled` | boolean | no | `false` | Enable Chrome build, validation, and packaging |
+| `chrome-build-dir` | string | no | `'build/chrome'` | Where Chrome build output lives |
+| `cws-submission-enabled` | boolean | no | `false` | Enable Chrome Web Store submission |
+| `cws-extension-id` | string | no | `''` | Chrome Web Store extension ID |
+| `chrome-min-version` | string | no | `'102+'` | Minimum Chrome version (release notes footer) |
 
-**Secrets** (both optional):
+**Secrets** (all optional):
 - `AMO_API_KEY` — AMO API issuer ID
 - `AMO_API_SECRET` — AMO API secret
+- `CWS_CLIENT_ID` — Chrome Web Store API client ID
+- `CWS_CLIENT_SECRET` — Chrome Web Store API client secret
+- `CWS_REFRESH_TOKEN` — Chrome Web Store API refresh token
 
 **Release behavior:**
-- **Stable tag push** (`v1.0.0`) — test, build, sign, create GitHub release. If `amo-submission-enabled` is true, submits to AMO listed channel
-- **Pre-release tag push** (`v1.0.0-rc1`) — test, build, sign unlisted, create GitHub pre-release. Never submitted to AMO listed
-- **Manual dispatch** — test, build. Optionally create release and/or submit to AMO based on inputs
+- **Stable tag push** (`v1.0.0`) — test, build, sign, create GitHub release. If `amo-submission-enabled` is true, submits to AMO. If `chrome-enabled` and `cws-submission-enabled`, submits to CWS
+- **Pre-release tag push** (`v1.0.0-rc1`) — test, build, sign unlisted, create GitHub pre-release. Never submitted to AMO/CWS listed
+- **Manual dispatch** — test, build. Optionally create release and/or submit to stores based on inputs
+- When `chrome-enabled` is true, releases include both Firefox `.xpi` and Chrome `.zip` assets
 
 ## Versioning This Repo
 
