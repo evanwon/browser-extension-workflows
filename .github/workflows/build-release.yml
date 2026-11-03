@@ -87,8 +87,9 @@ on:
         description: 'Minimum Chrome version for release notes footer'
         type: string
         default: '102+'
-    # The release job reads these from the caller's `release` environment, which overrides anything passed here, so
-    # callers pass none.
+    # Callers keep these in their `release` environment and pass each by name (`AMO_API_KEY: ${{ secrets.AMO_API_KEY }}`).
+    # A secret that isn't passed is empty here, even if the environment has it; one passed by name resolves to the
+    # environment's value in the release job, and to nothing in the build job, which has no environment.
     secrets:
       AMO_API_KEY:
         required: false

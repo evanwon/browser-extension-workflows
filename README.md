@@ -116,9 +116,15 @@ jobs:
       # cws-submission-enabled: ${{ vars.CWS_SUBMISSION_ENABLED == 'true' }}
       # cws-extension-id: ${{ vars.CWS_EXTENSION_ID }}
       # chrome-min-version: "102+"
+    # Pass each store key by name; it resolves to the `release` environment's value (step 5). A key that isn't passed
+    # arrives empty, with no error.
+    secrets:
+      AMO_API_KEY: ${{ secrets.AMO_API_KEY }}
+      AMO_API_SECRET: ${{ secrets.AMO_API_SECRET }}
+      # CWS_CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
+      # CWS_CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
+      # CWS_REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
 ```
-
-No `secrets:` line: the release job reads the store keys from your `release` environment (step 5).
 
 ### 4. Set up your manifest
 
@@ -286,7 +292,7 @@ Runs on `v*` tags or manual dispatch, in two jobs. `build` (no secrets): checkou
 | `cws-extension-id` | string | no | `''` | Chrome Web Store extension ID |
 | `chrome-min-version` | string | no | `'102+'` | Minimum Chrome version (release notes footer) |
 
-**Secrets** (all optional, read from the caller's `release` environment; callers pass none):
+**Secrets** (all optional; keep them in the caller's `release` environment and pass each by name, not with `secrets: inherit`):
 - `AMO_API_KEY` — AMO API issuer ID
 - `AMO_API_SECRET` — AMO API secret
 - `CWS_CLIENT_ID` — Chrome Web Store API client ID
