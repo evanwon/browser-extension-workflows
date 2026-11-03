@@ -1,0 +1,8 @@
+{
+  "name": "release-tools-chrome-webstore-upload",
+  "private": true,
+  "description": "chrome-webstore-upload-cli for the reusable workflows, installed from this lockfile with npm ci",
+  "dependencies": {
+    "chrome-webstore-upload-cli": "4.0.2"
+  }
+}
