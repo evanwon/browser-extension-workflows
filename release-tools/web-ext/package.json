@@ -1,0 +1,8 @@
+{
+  "name": "release-tools-web-ext",
+  "private": true,
+  "description": "web-ext for the reusable workflows, installed from this lockfile with npm ci",
+  "dependencies": {
+    "web-ext": "10.8.0"
+  }
+}

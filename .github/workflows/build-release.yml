@@ -60,9 +60,13 @@ on:
         type: string
         default: 'listed'
       version-notes:
-        description: 'Optional AMO submission notes (from workflow_dispatch passthrough)'
+        description: 'Optional AMO submission notes (from workflow_dispatch passthrough; not sent to AMO yet)'
         type: string
         default: ''
+      dry-run:
+        description: 'Build, then check the store keys in the release environment; sign, submit and release nothing'
+        type: boolean
+        default: false
       chrome-enabled:
         description: 'Enable Chrome build, validation, and packaging'
         type: boolean
@@ -83,6 +87,9 @@ on:
         description: 'Minimum Chrome version for release notes footer'
         type: string
         default: '102+'
+    # Callers keep these in their `release` environment and pass each by name (`AMO_API_KEY: ${{ secrets.AMO_API_KEY }}`).
+    # A secret that isn't passed is empty here, even if the environment has it; one passed by name resolves to the
+    # environment's value in the release job, and to nothing in the build job, which has no environment.
     secrets:
       AMO_API_KEY:
         required: false
@@ -95,25 +102,34 @@ on:
       CWS_REFRESH_TOKEN:
         required: false
 
+# Two jobs so the store keys never share a runner with third-party code. `build` runs npm ci, the tests and web-ext
+# lint/build (hundreds of npm packages, any of which could tamper with later steps in its job) and holds no secrets.
+# `release` runs only the store tools, installed from the lockfiles in release-tools/, and gets the keys from the
+# caller's `release` environment, which only `v*` tags can deploy to. It signs its own checkout of src/ rather than the
+# build job's output, so nothing the build job ran can change what Mozilla signs. The Chrome package does come from the
+# build job, because the caller's build script makes it.
 jobs:
-  build-and-release:
-    runs-on: ubuntu-latest
-
-    strategy:
-      matrix:
-        browser: [firefox]
+  build:
+    name: Build and test
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+      is_prerelease: ${{ steps.release_type.outputs.is_prerelease }}
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         fetch-depth: 50
+        persist-credentials: false
 
     - name: Fetch tags for changelog generation
       run: git fetch --tags origin
 
     - name: Setup Node.js
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
       with:
         node-version: '22'
         cache: 'npm'
@@ -143,20 +159,26 @@ jobs:
     - name: Run tests with coverage
       run: npm run test:ci
 
+    # The same web-ext the release job signs with, from this workflow's own commit
+    - name: Checkout build tools
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        repository: ${{ job.workflow_repository }}
+        ref: ${{ job.workflow_sha }}
+        path: .release-tools
+        sparse-checkout: release-tools
+        persist-credentials: false
+
     - name: Install build tools
       run: |
-        npm install -g web-ext@latest --ignore-scripts
-        if [ "${{ inputs.chrome-enabled }}" == "true" ]; then
-          npm install -g chrome-webstore-upload-cli@latest --ignore-scripts
-        fi
+        npm ci --ignore-scripts --no-audit --no-fund --prefix .release-tools/release-tools/web-ext
+        echo "$PWD/.release-tools/release-tools/web-ext/node_modules/.bin" >> "$GITHUB_PATH"
 
     - name: Validate manifest
       run: |
-        echo "Validating manifest.json for ${{ matrix.browser }}..."
         node -e "
           const manifest = JSON.parse(require('fs').readFileSync('src/manifest.json', 'utf8'));
           console.log('Extension:', manifest.name, 'v' + manifest.version);
-          console.log('Target browser: ${{ matrix.browser }}');
           if (!manifest.version) throw new Error('No version in manifest');
           if (manifest.manifest_version !== ${{ inputs.manifest-version }}) {
             throw new Error('Expected Manifest V${{ inputs.manifest-version }} but found V' + manifest.manifest_version);
@@ -208,7 +230,6 @@ jobs:
         fi
 
     - name: Firefox - Lint extension
-      if: matrix.browser == 'firefox'
       run: |
         echo "Firefox: Linting extension with web-ext..."
         if [ "${{ inputs.lint-warnings-as-errors }}" == "true" ]; then
@@ -218,113 +239,9 @@ jobs:
         fi
 
     - name: Firefox - Build extension
-      if: matrix.browser == 'firefox'
       run: |
         echo "Firefox: Building extension with web-ext..."
-        web-ext build --source-dir=src --artifacts-dir=dist --overwrite-dest
-
-    - name: Firefox - Determine AMO submission
-      if: matrix.browser == 'firefox'
-      id: amo_config
-      run: |
-        # Pre-releases never go to AMO listed channel
-        if [[ "${{ steps.release_type.outputs.is_prerelease }}" == "true" ]]; then
-          echo "submit=false" >> $GITHUB_OUTPUT
-          echo "channel=unlisted" >> $GITHUB_OUTPUT
-          echo "Pre-release: Will sign via unlisted channel only"
-        elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-          # Manual trigger - use provided inputs
-          echo "submit=${{ inputs.submit-to-amo }}" >> $GITHUB_OUTPUT
-          echo "channel=${{ inputs.channel }}" >> $GITHUB_OUTPUT
-        elif [[ "${{ github.event_name }}" == "push" && "${{ inputs.amo-submission-enabled }}" == "true" ]]; then
-          # Stable release with AMO enabled
-          echo "submit=true" >> $GITHUB_OUTPUT
-          echo "channel=listed" >> $GITHUB_OUTPUT
-        else
-          echo "submit=false" >> $GITHUB_OUTPUT
-          echo "channel=unlisted" >> $GITHUB_OUTPUT
-        fi
-
-        # Log configuration for debugging
-        echo "AMO submission enabled input: ${{ inputs.amo-submission-enabled }}"
-        echo "Event type: ${{ github.event_name }}"
-
-    - name: Firefox - Submit to AMO (listed channel)
-      if: matrix.browser == 'firefox' && steps.amo_config.outputs.submit == 'true' && steps.amo_config.outputs.channel == 'listed'
-      env:
-        AMO_API_KEY: ${{ secrets.AMO_API_KEY }}
-        AMO_API_SECRET: ${{ secrets.AMO_API_SECRET }}
-      run: |
-        # Check if AMO credentials are configured
-        if [[ -z "$AMO_API_KEY" || -z "$AMO_API_SECRET" ]]; then
-          echo "AMO credentials not configured. Please set AMO_API_KEY and AMO_API_SECRET secrets."
-          echo "amo_submitted=false" >> $GITHUB_ENV
-          exit 1
-        fi
-
-        echo "Firefox: Submitting to AMO for public distribution..."
-
-        # Prepare submission notes
-        if [[ -n "${{ inputs.version-notes }}" ]]; then
-          NOTES="${{ inputs.version-notes }}"
-        else
-          NOTES="Automated submission for version ${{ steps.get_version.outputs.version }}"
-        fi
-
-        # Create source code archive for AMO review (required for listed submissions)
-        echo "Creating source code archive..."
-        git archive -o dist/source-code.zip HEAD
-
-        # Submit to AMO listed channel (public distribution)
-        web-ext sign --source-dir=src --artifacts-dir=dist-amo \
-          --api-key="$AMO_API_KEY" --api-secret="$AMO_API_SECRET" \
-          --channel=listed \
-          --upload-source-code=dist/source-code.zip \
-          --timeout=300000
-
-        echo "Successfully submitted to AMO for review"
-        echo "amo_submitted=true" >> $GITHUB_ENV
-
-    - name: Firefox - Sign extension (unlisted/self-distribution)
-      if: matrix.browser == 'firefox' && (steps.amo_config.outputs.submit == 'false' || steps.amo_config.outputs.channel == 'unlisted')
-      env:
-        AMO_API_KEY: ${{ secrets.AMO_API_KEY }}
-        AMO_API_SECRET: ${{ secrets.AMO_API_SECRET }}
-      run: |
-        # Check if AMO credentials are configured
-        if [[ -z "$AMO_API_KEY" || -z "$AMO_API_SECRET" ]]; then
-          echo "AMO credentials not configured. Skipping signing."
-          echo "Extension will be unsigned (requires Developer Edition or temporary installation)"
-          exit 0
-        fi
-
-        echo "Firefox: Signing extension for self-distribution..."
-        web-ext sign --source-dir=src --artifacts-dir=dist-signed \
-          --api-key="$AMO_API_KEY" --api-secret="$AMO_API_SECRET" \
-          --channel=unlisted \
-          --timeout=300000
-
-    - name: Firefox - Get build artifact
-      if: matrix.browser == 'firefox'
-      id: get_firefox_artifact
-      run: |
-        # Check for AMO submitted version, then signed version, then fall back to unsigned
-        if [ "${{ env.amo_submitted }}" == "true" ] && [ -d "dist-amo" ] && [ "$(ls -A dist-amo/*.xpi 2>/dev/null)" ]; then
-          filename=$(ls dist-amo/*.xpi | head -1 | xargs basename)
-          filepath="dist-amo/$filename"
-          echo "signed=amo" >> $GITHUB_OUTPUT
-        elif [ -d "dist-signed" ] && [ "$(ls -A dist-signed/*.xpi 2>/dev/null)" ]; then
-          filename=$(ls dist-signed/*.xpi | head -1 | xargs basename)
-          filepath="dist-signed/$filename"
-          echo "signed=true" >> $GITHUB_OUTPUT
-        else
-          filename=$(ls dist/*.zip | head -1 | xargs basename)
-          filepath="dist/$filename"
-          echo "signed=false" >> $GITHUB_OUTPUT
-        fi
-        echo "filename=$filename" >> $GITHUB_OUTPUT
-        echo "filepath=$filepath" >> $GITHUB_OUTPUT
-        echo "Found Firefox artifact: $filename (signed: $([ -d dist-signed ] && echo 'yes' || echo 'no'))"
+        web-ext build --source-dir=src --artifacts-dir=dist/firefox --overwrite-dest
 
     - name: Chrome - Build extension
       if: inputs.chrome-enabled
@@ -347,40 +264,16 @@ jobs:
       run: |
         EXT_NAME="${{ inputs.extension-name }}"
         VERSION="${{ steps.get_version.outputs.version }}"
-        mkdir -p dist
+        mkdir -p dist/chrome
         cd ${{ inputs.chrome-build-dir }}
-        zip -r "../../dist/${EXT_NAME}-chrome-v${VERSION}.zip" .
-        cd ../..
-        echo "chrome_zip=dist/${EXT_NAME}-chrome-v${VERSION}.zip" >> $GITHUB_ENV
-
-    - name: Chrome - Submit to Chrome Web Store
-      if: >
-        inputs.chrome-enabled &&
-        inputs.cws-submission-enabled &&
-        steps.release_type.outputs.is_prerelease == 'false'
-      env:
-        CWS_CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
-        CWS_CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
-        CWS_REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
-      run: |
-        if [[ -z "$CWS_CLIENT_ID" || -z "$CWS_CLIENT_SECRET" || -z "$CWS_REFRESH_TOKEN" ]]; then
-          echo "Chrome Web Store credentials not configured. Skipping submission."
-          exit 0
-        fi
-        EXT_NAME="${{ inputs.extension-name }}"
-        VERSION="${{ steps.get_version.outputs.version }}"
-        chrome-webstore-upload upload \
-          --source "dist/${EXT_NAME}-chrome-v${VERSION}.zip" \
-          --extension-id "${{ inputs.cws-extension-id }}" \
-          --client-id "$CWS_CLIENT_ID" \
-          --client-secret "$CWS_CLIENT_SECRET" \
-          --refresh-token "$CWS_REFRESH_TOKEN"
+        zip -r "$GITHUB_WORKSPACE/dist/chrome/${EXT_NAME}-chrome-v${VERSION}.zip" .
 
     - name: Generate changelog
-      id: changelog
       run: |
         CURRENT_VERSION="${{ steps.get_version.outputs.version_name }}"
         IS_PRERELEASE="${{ steps.release_type.outputs.is_prerelease }}"
+        CHANGELOG=dist/changelog.md
+        mkdir -p dist
 
         # Function to check if a tag is a pre-release
         is_prerelease_tag() {
@@ -413,61 +306,280 @@ jobs:
         # Generate the changelog
         if [ -n "$previous_stable" ]; then
           echo "Generating changelog from $previous_stable to HEAD..."
-          echo "changelog<<EOF" >> $GITHUB_OUTPUT
 
           if [ "$IS_PRERELEASE" == "true" ]; then
-            echo "### Changes in this pre-release (since stable $previous_stable)" >> $GITHUB_OUTPUT
+            echo "### Changes in this pre-release (since stable $previous_stable)" >> $CHANGELOG
           else
-            echo "### Changes since $previous_stable" >> $GITHUB_OUTPUT
+            echo "### Changes since $previous_stable" >> $CHANGELOG
           fi
 
           commit_count=$(git rev-list --count $previous_stable..HEAD)
-          echo "" >> $GITHUB_OUTPUT
-          echo "_${commit_count} commits since last stable release_" >> $GITHUB_OUTPUT
-          echo "" >> $GITHUB_OUTPUT
+          echo "" >> $CHANGELOG
+          echo "_${commit_count} commits since last stable release_" >> $CHANGELOG
+          echo "" >> $CHANGELOG
 
-          git log --pretty=format:"- %s (%h)" $previous_stable..HEAD >> $GITHUB_OUTPUT
-          echo "" >> $GITHUB_OUTPUT
-
-          echo "EOF" >> $GITHUB_OUTPUT
+          git log --pretty=format:"- %s (%h)" $previous_stable..HEAD >> $CHANGELOG
+          echo "" >> $CHANGELOG
         else
           echo "No previous stable release found, generating initial release notes..."
-          echo "changelog<<EOF" >> $GITHUB_OUTPUT
-          echo "## Initial Release" >> $GITHUB_OUTPUT
-          echo "First official release of ${{ inputs.extension-display-name }}." >> $GITHUB_OUTPUT
-          echo "" >> $GITHUB_OUTPUT
-          echo "### Features" >> $GITHUB_OUTPUT
-          git log --pretty=format:"- %s (%h)" --reverse >> $GITHUB_OUTPUT
-          echo "" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          echo "## Initial Release" >> $CHANGELOG
+          echo "First official release of ${{ inputs.extension-display-name }}." >> $CHANGELOG
+          echo "" >> $CHANGELOG
+          echo "### Features" >> $CHANGELOG
+          git log --pretty=format:"- %s (%h)" --reverse >> $CHANGELOG
+          echo "" >> $CHANGELOG
         fi
 
+    # The unsigned builds and changelog, for the release job and for anyone downloading a manual build
+    - name: Upload build
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: extension-v${{ steps.get_version.outputs.version }}
+        path: dist/
+        if-no-files-found: error
+        retention-days: 30
+
+  release:
+    name: Sign and release
+    needs: build
+    # A manual run that asks for nothing stops after the build, without touching the keys
+    if: github.event_name == 'push' || inputs.dry-run || inputs.submit-to-amo || inputs.create-release
+    runs-on: ubuntu-26.04
+    environment: release
+    permissions:
+      contents: write
+    env:
+      EXT_NAME: ${{ inputs.extension-name }}
+      VERSION: ${{ needs.build.outputs.version }}
+      IS_PRERELEASE: ${{ needs.build.outputs.is_prerelease }}
+      CWS_UPLOAD: ${{ inputs.chrome-enabled && inputs.cws-submission-enabled }}
+
+    steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: '22'
+
+    - name: Check the store keys (dry run)
+      if: inputs.dry-run
+      env:
+        AMO_API_KEY: ${{ secrets.AMO_API_KEY }}
+        AMO_API_SECRET: ${{ secrets.AMO_API_SECRET }}
+        CWS_CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
+        CWS_CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
+        CWS_REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
+      # Read-only calls: AMO's profile endpoint, and Google's token exchange. Nothing is uploaded.
+      run: |
+        node --input-type=module <<'EOF'
+        import crypto from 'node:crypto';
+        const env = process.env;
+        let failed = false;
+        const fail = (message) => { console.log(`::error::${message}`); failed = true; };
+
+        if (!env.AMO_API_KEY || !env.AMO_API_SECRET) {
+          fail('AMO_API_KEY and AMO_API_SECRET are not set in the release environment');
+        } else {
+          const part = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+          const iat = Math.floor(Date.now() / 1000);
+          const claims = { iss: env.AMO_API_KEY, jti: crypto.randomUUID(), iat, exp: iat + 60 };
+          const body = `${part({ alg: 'HS256', typ: 'JWT' })}.${part(claims)}`;
+          const jwt = `${body}.${crypto.createHmac('sha256', env.AMO_API_SECRET).update(body).digest('base64url')}`;
+          const res = await fetch('https://addons.mozilla.org/api/v5/accounts/profile/', {
+            headers: { Authorization: `JWT ${jwt}` },
+          });
+          if (res.ok) console.log('AMO accepted the keys');
+          else fail(`AMO refused the keys: HTTP ${res.status} ${await res.text()}`);
+        }
+
+        if (env.CWS_UPLOAD === 'true') {
+          if (!env.CWS_CLIENT_ID || !env.CWS_CLIENT_SECRET || !env.CWS_REFRESH_TOKEN) {
+            fail('CWS_CLIENT_ID, CWS_CLIENT_SECRET and CWS_REFRESH_TOKEN are not set in the release environment');
+          } else {
+            const res = await fetch('https://oauth2.googleapis.com/token', {
+              method: 'POST',
+              body: new URLSearchParams({
+                client_id: env.CWS_CLIENT_ID,
+                client_secret: env.CWS_CLIENT_SECRET,
+                refresh_token: env.CWS_REFRESH_TOKEN,
+                grant_type: 'refresh_token',
+              }),
+            });
+            if (res.ok) console.log('Google accepted the Chrome Web Store keys');
+            else fail(`Google refused the Chrome Web Store keys: HTTP ${res.status}`);
+          }
+        }
+
+        process.exit(failed ? 1 : 0);
+        EOF
+
+    - name: Checkout code
+      if: "!inputs.dry-run"
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: Checkout release tools
+      if: "!inputs.dry-run"
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        repository: ${{ job.workflow_repository }}
+        ref: ${{ job.workflow_sha }}
+        path: .release-tools
+        sparse-checkout: release-tools
+        persist-credentials: false
+
+    - name: Install release tools
+      if: "!inputs.dry-run"
+      run: |
+        npm ci --ignore-scripts --no-audit --no-fund --prefix .release-tools/release-tools/web-ext
+        echo "$PWD/.release-tools/release-tools/web-ext/node_modules/.bin" >> "$GITHUB_PATH"
+        if [ "$CWS_UPLOAD" == "true" ]; then
+          npm ci --ignore-scripts --no-audit --no-fund --prefix .release-tools/release-tools/chrome-webstore-upload
+          echo "$PWD/.release-tools/release-tools/chrome-webstore-upload/node_modules/.bin" >> "$GITHUB_PATH"
+        fi
+
+    - name: Download build
+      if: "!inputs.dry-run"
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: extension-v${{ needs.build.outputs.version }}
+        path: dist
+
+    - name: Firefox - Determine AMO submission
+      if: "!inputs.dry-run"
+      id: amo_config
+      env:
+        EVENT: ${{ github.event_name }}
+        SUBMIT_TO_AMO: ${{ inputs.submit-to-amo }}
+        CHANNEL: ${{ inputs.channel }}
+        AMO_SUBMISSION_ENABLED: ${{ inputs.amo-submission-enabled }}
+      run: |
+        if [[ "$IS_PRERELEASE" == "true" ]]; then
+          # Pre-releases never go to AMO listed channel
+          channel=unlisted
+        elif [[ "$EVENT" == "workflow_dispatch" && "$SUBMIT_TO_AMO" == "true" ]]; then
+          channel=$CHANNEL
+        elif [[ "$EVENT" == "push" && "$AMO_SUBMISSION_ENABLED" == "true" ]]; then
+          channel=listed
+        else
+          channel=unlisted
+        fi
+        echo "channel=$channel" >> "$GITHUB_OUTPUT"
+        echo "AMO channel: $channel (event $EVENT, pre-release $IS_PRERELEASE, AMO submission enabled $AMO_SUBMISSION_ENABLED)"
+
+    - name: Firefox - Submit to AMO (listed channel)
+      if: steps.amo_config.outputs.channel == 'listed'
+      env:
+        WEB_EXT_API_KEY: ${{ secrets.AMO_API_KEY }}
+        WEB_EXT_API_SECRET: ${{ secrets.AMO_API_SECRET }}
+      run: |
+        if [[ -z "$WEB_EXT_API_KEY" || -z "$WEB_EXT_API_SECRET" ]]; then
+          echo "::error::AMO credentials not configured. Set AMO_API_KEY and AMO_API_SECRET in the release environment."
+          exit 1
+        fi
+
+        echo "Firefox: Submitting to AMO for public distribution..."
+
+        # AMO reviewers get the source of the commit being released (required for listed submissions)
+        git archive -o "$RUNNER_TEMP/source-code.zip" HEAD
+
+        web-ext sign --source-dir=src --artifacts-dir=dist-amo \
+          --channel=listed \
+          --upload-source-code="$RUNNER_TEMP/source-code.zip" \
+          --timeout=300000
+
+        echo "Successfully submitted to AMO for review"
+        echo "amo_submitted=true" >> $GITHUB_ENV
+
+    - name: Firefox - Sign extension (unlisted/self-distribution)
+      if: steps.amo_config.outputs.channel == 'unlisted'
+      env:
+        WEB_EXT_API_KEY: ${{ secrets.AMO_API_KEY }}
+        WEB_EXT_API_SECRET: ${{ secrets.AMO_API_SECRET }}
+      run: |
+        if [[ -z "$WEB_EXT_API_KEY" || -z "$WEB_EXT_API_SECRET" ]]; then
+          echo "AMO credentials not configured. Skipping signing."
+          echo "Extension will be unsigned (requires Developer Edition or temporary installation)"
+          exit 0
+        fi
+
+        echo "Firefox: Signing extension for self-distribution..."
+        web-ext sign --source-dir=src --artifacts-dir=dist-signed \
+          --channel=unlisted \
+          --timeout=300000
+
+    - name: Firefox - Get build artifact
+      if: "!inputs.dry-run"
+      id: get_firefox_artifact
+      run: |
+        # Check for AMO submitted version, then signed version, then fall back to the build job's unsigned one
+        if [ "${{ env.amo_submitted }}" == "true" ] && [ -d "dist-amo" ] && [ "$(ls -A dist-amo/*.xpi 2>/dev/null)" ]; then
+          filename=$(ls dist-amo/*.xpi | head -1 | xargs basename)
+          filepath="dist-amo/$filename"
+          echo "signed=amo" >> $GITHUB_OUTPUT
+        elif [ -d "dist-signed" ] && [ "$(ls -A dist-signed/*.xpi 2>/dev/null)" ]; then
+          filename=$(ls dist-signed/*.xpi | head -1 | xargs basename)
+          filepath="dist-signed/$filename"
+          echo "signed=true" >> $GITHUB_OUTPUT
+        else
+          filename=$(ls dist/firefox/*.zip | head -1 | xargs basename)
+          filepath="dist/firefox/$filename"
+          echo "signed=false" >> $GITHUB_OUTPUT
+        fi
+        echo "filename=$filename" >> $GITHUB_OUTPUT
+        echo "filepath=$filepath" >> $GITHUB_OUTPUT
+        echo "Found Firefox artifact: $filename (signed: $([ -d dist-signed ] && echo 'yes' || echo 'no'))"
+
+    - name: Chrome - Submit to Chrome Web Store
+      if: "!inputs.dry-run && env.CWS_UPLOAD == 'true' && env.IS_PRERELEASE == 'false'"
+      env:
+        CWS_CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
+        CWS_CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
+        CWS_REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
+        CWS_EXTENSION_ID: ${{ inputs.cws-extension-id }}
+      run: |
+        if [[ -z "$CWS_CLIENT_ID" || -z "$CWS_CLIENT_SECRET" || -z "$CWS_REFRESH_TOKEN" ]]; then
+          echo "Chrome Web Store credentials not configured. Skipping submission."
+          exit 0
+        fi
+        chrome-webstore-upload upload \
+          --source "dist/chrome/${EXT_NAME}-chrome-v${VERSION}.zip" \
+          --extension-id "$CWS_EXTENSION_ID" \
+          --client-id "$CWS_CLIENT_ID" \
+          --client-secret "$CWS_CLIENT_SECRET" \
+          --refresh-token "$CWS_REFRESH_TOKEN"
+
     - name: Create Release with Assets
-      if: matrix.browser == 'firefox' && (github.event_name == 'push' || inputs.create-release)
+      if: "!inputs.dry-run && (github.event_name == 'push' || inputs.create-release)"
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GH_REPO: ${{ github.repository }}
+        SIGNED: ${{ steps.get_firefox_artifact.outputs.signed }}
+        FIREFOX_ARTIFACT: ${{ steps.get_firefox_artifact.outputs.filepath }}
+        DISPLAY_NAME: ${{ inputs.extension-display-name }}
+        DESCRIPTION: ${{ inputs.extension-description }}
+        AMO_URL: ${{ inputs.amo-url }}
+        ISSUES_URL: ${{ inputs.issues-url }}
+        FF_MIN: ${{ inputs.firefox-min-version }}
+        CHROME_ENABLED: ${{ inputs.chrome-enabled }}
+        CHROME_MIN: ${{ inputs.chrome-min-version }}
+        PERMISSIONS: ${{ inputs.permissions-description }}
+        EVENT: ${{ github.event_name }}
+        TAG: ${{ github.ref_name }}
       run: |
-        EXT_NAME="${{ inputs.extension-name }}"
-        VERSION="${{ steps.get_version.outputs.version }}"
-        SIGNED="${{ steps.get_firefox_artifact.outputs.signed }}"
-
         # Use appropriate source path and extension
         if [ "$SIGNED" == "amo" ]; then
-          cp "${{ steps.get_firefox_artifact.outputs.filepath }}" "dist/${EXT_NAME}-firefox-v${VERSION}-amo.xpi"
+          cp "$FIREFOX_ARTIFACT" "dist/${EXT_NAME}-firefox-v${VERSION}-amo.xpi"
           xpi_file="dist/${EXT_NAME}-firefox-v${VERSION}-amo.xpi"
         elif [ "$SIGNED" == "true" ]; then
-          cp "${{ steps.get_firefox_artifact.outputs.filepath }}" "dist/${EXT_NAME}-firefox-v${VERSION}-signed.xpi"
+          cp "$FIREFOX_ARTIFACT" "dist/${EXT_NAME}-firefox-v${VERSION}-signed.xpi"
           xpi_file="dist/${EXT_NAME}-firefox-v${VERSION}-signed.xpi"
         else
-          mv "${{ steps.get_firefox_artifact.outputs.filepath }}" "dist/${EXT_NAME}-firefox-v${VERSION}.xpi"
+          mv "$FIREFOX_ARTIFACT" "dist/${EXT_NAME}-firefox-v${VERSION}.xpi"
           xpi_file="dist/${EXT_NAME}-firefox-v${VERSION}.xpi"
         fi
 
         # Create release notes file
-        DISPLAY_NAME="${{ inputs.extension-display-name }}"
-        DESCRIPTION="${{ inputs.extension-description }}"
-        AMO_URL="${{ inputs.amo-url }}"
-
         cat > release_notes.md << NOTES_EOF
         # ${DISPLAY_NAME} v${VERSION}
 
@@ -522,8 +634,7 @@ jobs:
         fi
 
         # Add Chrome installation instructions if chrome-enabled
-        if [ "${{ inputs.chrome-enabled }}" == "true" ]; then
-          CHROME_MIN="${{ inputs.chrome-min-version }}"
+        if [ "$CHROME_ENABLED" == "true" ]; then
           cat >> release_notes.md << 'NOTES_EOF'
 
         ## Chrome Installation
@@ -538,8 +649,7 @@ jobs:
         fi
 
         # Add pre-release notice if applicable
-        ISSUES_URL="${{ inputs.issues-url }}"
-        if [ "${{ steps.release_type.outputs.is_prerelease }}" == "true" ]; then
+        if [ "$IS_PRERELEASE" == "true" ]; then
           cat >> release_notes.md << NOTES_EOF
 
         ---
@@ -554,11 +664,7 @@ jobs:
         NOTES_EOF
         fi
 
-        CHANGELOG="${{ steps.changelog.outputs.changelog }}"
-        FF_MIN="${{ inputs.firefox-min-version }}"
-        PERMISSIONS="${{ inputs.permissions-description }}"
-
-        CHROME_MIN="${{ inputs.chrome-min-version }}"
+        CHANGELOG=$(cat dist/changelog.md)
 
         cat >> release_notes.md << NOTES_EOF
 
@@ -570,7 +676,7 @@ jobs:
         **Firefox Requirements:** Version ${FF_MIN}
         NOTES_EOF
 
-        if [ "${{ inputs.chrome-enabled }}" == "true" ]; then
+        if [ "$CHROME_ENABLED" == "true" ]; then
           echo "**Chrome Requirements:** Version ${CHROME_MIN}" >> release_notes.md
         fi
 
@@ -579,7 +685,7 @@ jobs:
         NOTES_EOF
 
         # Determine release flags based on type
-        if [[ "${{ steps.release_type.outputs.is_prerelease }}" == "true" ]]; then
+        if [[ "$IS_PRERELEASE" == "true" ]]; then
           RELEASE_FLAGS="--prerelease"
           RELEASE_TITLE="${DISPLAY_NAME} v${VERSION} (Pre-release)"
         else
@@ -589,19 +695,21 @@ jobs:
 
         # Collect release assets
         ASSETS=("$xpi_file")
-        if [ "${{ inputs.chrome-enabled }}" == "true" ] && [ -f "${{ env.chrome_zip }}" ]; then
-          ASSETS+=("${{ env.chrome_zip }}")
+        chrome_zip="dist/chrome/${EXT_NAME}-chrome-v${VERSION}.zip"
+        if [ "$CHROME_ENABLED" == "true" ] && [ -f "$chrome_zip" ]; then
+          ASSETS+=("$chrome_zip")
         fi
 
         # Create release with assets using GitHub CLI
-        if [[ "${{ github.event_name }}" == "push" ]]; then
-          gh release create "${{ github.ref_name }}" \
+        if [[ "$EVENT" == "push" ]]; then
+          gh release create "$TAG" \
             --title "$RELEASE_TITLE" \
             --notes-file release_notes.md \
             $RELEASE_FLAGS \
             "${ASSETS[@]}"
         else
           gh release create "v${VERSION}-manual-$(date +%Y%m%d%H%M%S)" \
+            --target "$GITHUB_SHA" \
             --title "$RELEASE_TITLE (Manual Build)" \
             --notes-file release_notes.md \
             --prerelease \
@@ -609,11 +717,12 @@ jobs:
         fi
 
     - name: Build Summary
+      if: "!inputs.dry-run"
+      env:
+        SIGNED: ${{ steps.get_firefox_artifact.outputs.signed }}
+        CHROME_ENABLED: ${{ inputs.chrome-enabled }}
+        RELEASED: ${{ github.event_name == 'push' || inputs.create-release }}
       run: |
-        EXT_NAME="${{ inputs.extension-name }}"
-        VERSION="${{ steps.get_version.outputs.version }}"
-        SIGNED="${{ steps.get_firefox_artifact.outputs.signed }}"
-
         echo "Build completed for v${VERSION}!"
 
         # Firefox summary
@@ -627,24 +736,22 @@ jobs:
         fi
 
         # Chrome summary
-        if [ "${{ inputs.chrome-enabled }}" == "true" ]; then
+        if [ "$CHROME_ENABLED" == "true" ]; then
           echo "Chrome Asset: ${EXT_NAME}-chrome-v${VERSION}.zip"
         fi
 
-        if [[ "${{ github.event_name }}" == "push" || "${{ inputs.create-release }}" == "true" ]]; then
+        if [[ "$RELEASED" == "true" ]]; then
           echo "Release URL: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}"
         else
           echo "Build artifacts available in workflow run"
         fi
 
-    - name: Upload artifacts (manual builds)
-      if: github.event_name == 'workflow_dispatch' && !inputs.create-release
-      uses: actions/upload-artifact@v4
+    - name: Upload signed artifacts (manual builds)
+      if: github.event_name == 'workflow_dispatch' && !inputs.create-release && !inputs.dry-run
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
-        name: extension-v${{ steps.get_version.outputs.version }}
+        name: extension-v${{ needs.build.outputs.version }}-signed
         path: |
-          dist/*.zip
-          dist/*.xpi
           dist-signed/*.xpi
           dist-amo/*.xpi
         retention-days: 30

@@ -1,0 +1,24 @@
+# Monthly PRs keeping the pinned actions and the release tools current. The cooldown skips versions under 7 days old,
+# since a hijacked release is usually caught and pulled within days, and the release tools run next to the store keys.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: npm
+    directories:
+      - /release-tools/web-ext
+      - /release-tools/chrome-webstore-upload
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      release-tools:
+        patterns: ["*"]

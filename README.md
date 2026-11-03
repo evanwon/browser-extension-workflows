@@ -33,6 +33,9 @@ The `test:ci` script is called by the shared workflows — use whatever test run
 
 The shared workflows are [reusable workflows](https://docs.github.com/en/actions/sharing-automations/reusing-workflows). Your repo needs thin caller files in `.github/workflows/` that delegate to them.
 
+Pin each `uses:` to a release's full commit SHA, with the tag in a comment, and let Dependabot's `github-actions`
+updates move it. A tag can be moved after you've reviewed it; a SHA can't.
+
 #### `.github/workflows/test-pr.yml`
 
 ```yaml
@@ -44,7 +47,7 @@ on:
 
 jobs:
   test:
-    uses: evanwon/browser-extension-workflows/.github/workflows/test-pr.yml@v1
+    uses: evanwon/browser-extension-workflows/.github/workflows/test-pr.yml@<commit SHA of v1.2.0> # v1.2.0
     with:
       lint-warnings-as-errors: false
       validate-versions: true
@@ -62,9 +65,14 @@ on:
   push:
     tags:
       - 'v*'
+      - '!v*-dryrun'   # a tag for dry runs, which releases nothing by itself
 
   workflow_dispatch:
     inputs:
+      dry_run:
+        description: 'Check the store keys only (run it on a v*-dryrun tag)'
+        type: boolean
+        default: false
       create_release:
         description: 'Create GitHub release'
         type: boolean
@@ -86,7 +94,7 @@ permissions:
 
 jobs:
   build:
-    uses: evanwon/browser-extension-workflows/.github/workflows/build-release.yml@v1
+    uses: evanwon/browser-extension-workflows/.github/workflows/build-release.yml@<commit SHA of v1.2.0> # v1.2.0
     with:
       extension-name: my-extension
       extension-display-name: "My Extension"
@@ -102,12 +110,20 @@ jobs:
       create-release: ${{ github.event.inputs.create_release == 'true' }}
       submit-to-amo: ${{ github.event.inputs.submit_to_amo == 'true' }}
       channel: ${{ github.event.inputs.channel || 'listed' }}
+      dry-run: ${{ github.event.inputs.dry_run == 'true' }}
       # Chrome support (opt-in):
       # chrome-enabled: true
       # cws-submission-enabled: ${{ vars.CWS_SUBMISSION_ENABLED == 'true' }}
       # cws-extension-id: ${{ vars.CWS_EXTENSION_ID }}
       # chrome-min-version: "102+"
-    secrets: inherit
+    # Pass each store key by name; it resolves to the `release` environment's value (step 5). A key that isn't passed
+    # arrives empty, with no error.
+    secrets:
+      AMO_API_KEY: ${{ secrets.AMO_API_KEY }}
+      AMO_API_SECRET: ${{ secrets.AMO_API_SECRET }}
+      # CWS_CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
+      # CWS_CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
+      # CWS_REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
 ```
 
 ### 4. Set up your manifest
@@ -123,22 +139,40 @@ Your `src/manifest.json` must include both `version` and `version_name` fields:
 
 The `version:bump` tool manages both fields automatically.
 
-### 5. Configure GitHub secrets (optional)
+### 5. Create the `release` environment and its secrets (optional)
 
-For automated AMO signing/submission and/or Chrome Web Store uploads:
+For automated AMO signing/submission and/or Chrome Web Store uploads. The store keys go in an environment named
+`release` that only `v*` tags may deploy to, so a workflow on any branch, or a PR's, can't reach them:
 
-| Type | Name | Description |
-|------|------|-------------|
-| Secret | `AMO_API_KEY` | AMO API issuer ID (Firefox) |
-| Secret | `AMO_API_SECRET` | AMO API secret (Firefox) |
-| Variable | `AMO_SUBMISSION_ENABLED` | Set to `true` to auto-submit stable tags to AMO listed channel |
-| Secret | `CWS_CLIENT_ID` | Chrome Web Store API client ID |
-| Secret | `CWS_CLIENT_SECRET` | Chrome Web Store API client secret |
-| Secret | `CWS_REFRESH_TOKEN` | Chrome Web Store API refresh token |
-| Variable | `CWS_SUBMISSION_ENABLED` | Set to `true` to enable CWS uploads on stable tags |
-| Variable | `CWS_EXTENSION_ID` | Chrome Web Store extension ID |
+```bash
+gh api -X PUT repos/OWNER/REPO/environments/release --input - <<'EOF'
+{"deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}
+EOF
+gh api -X POST repos/OWNER/REPO/environments/release/deployment-branch-policies -f name='v*' -f type=tag
+gh secret set AMO_API_KEY --env release --repo OWNER/REPO      # prompts for the value
+gh secret set AMO_API_SECRET --env release --repo OWNER/REPO
+```
+
+| Type | Where | Name | Description |
+|------|-------|------|-------------|
+| Secret | `release` environment | `AMO_API_KEY` | AMO API issuer ID (Firefox) |
+| Secret | `release` environment | `AMO_API_SECRET` | AMO API secret (Firefox) |
+| Variable | repository | `AMO_SUBMISSION_ENABLED` | Set to `true` to auto-submit stable tags to AMO listed channel |
+| Secret | `release` environment | `CWS_CLIENT_ID` | Chrome Web Store API client ID |
+| Secret | `release` environment | `CWS_CLIENT_SECRET` | Chrome Web Store API client secret |
+| Secret | `release` environment | `CWS_REFRESH_TOKEN` | Chrome Web Store API refresh token |
+| Variable | repository | `CWS_SUBMISSION_ENABLED` | Set to `true` to enable CWS uploads on stable tags |
+| Variable | repository | `CWS_EXTENSION_ID` | Chrome Web Store extension ID |
 
 Without credentials, builds still run — you just get unsigned artifacts.
+
+To check the keys without releasing anything, push a dry-run tag and run the workflow on it:
+
+```bash
+git tag v0.0.0-dryrun && git push origin v0.0.0-dryrun
+gh workflow run build-release.yml --ref v0.0.0-dryrun -f dry_run=true
+git push origin :v0.0.0-dryrun && git tag -d v0.0.0-dryrun   # once it has finished
+```
 
 ## Conventions
 
@@ -232,7 +266,7 @@ Runs on PRs. Steps: checkout, install, validate versions, security audit, web-ex
 
 ### build-release.yml
 
-Runs on `v*` tags or manual dispatch. Steps: checkout, install, validate, audit, test, lint, build, determine AMO channel, sign/submit, generate changelog, create GitHub release.
+Runs on `v*` tags or manual dispatch, in two jobs. `build` (no secrets): checkout, install, validate, audit, test, lint, build, generate changelog. `release` (in the `release` environment): sign/submit from its own checkout of `src/`, upload to CWS, create GitHub release.
 
 | Input | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
@@ -250,14 +284,15 @@ Runs on `v*` tags or manual dispatch. Steps: checkout, install, validate, audit,
 | `create-release` | boolean | no | `false` | Create GitHub release (for `workflow_dispatch`) |
 | `submit-to-amo` | boolean | no | `false` | Submit to AMO (for `workflow_dispatch`) |
 | `channel` | string | no | `'listed'` | AMO channel (for `workflow_dispatch`) |
-| `version-notes` | string | no | `''` | Optional AMO submission notes |
+| `version-notes` | string | no | `''` | Optional AMO submission notes (not sent to AMO yet) |
+| `dry-run` | boolean | no | `false` | Build, then check the store keys in the `release` environment; sign, submit and release nothing |
 | `chrome-enabled` | boolean | no | `false` | Enable Chrome build, validation, and packaging |
 | `chrome-build-dir` | string | no | `'build/chrome'` | Where Chrome build output lives |
 | `cws-submission-enabled` | boolean | no | `false` | Enable Chrome Web Store submission |
 | `cws-extension-id` | string | no | `''` | Chrome Web Store extension ID |
 | `chrome-min-version` | string | no | `'102+'` | Minimum Chrome version (release notes footer) |
 
-**Secrets** (all optional):
+**Secrets** (all optional; keep them in the caller's `release` environment and pass each by name, not with `secrets: inherit`):
 - `AMO_API_KEY` — AMO API issuer ID
 - `AMO_API_SECRET` — AMO API secret
 - `CWS_CLIENT_ID` — Chrome Web Store API client ID
@@ -267,16 +302,13 @@ Runs on `v*` tags or manual dispatch. Steps: checkout, install, validate, audit,
 **Release behavior:**
 - **Stable tag push** (`v1.0.0`) — test, build, sign, create GitHub release. If `amo-submission-enabled` is true, submits to AMO. If `chrome-enabled` and `cws-submission-enabled`, submits to CWS
 - **Pre-release tag push** (`v1.0.0-rc1`) — test, build, sign unlisted, create GitHub pre-release. Never submitted to AMO/CWS listed
-- **Manual dispatch** — test, build. Optionally create release and/or submit to stores based on inputs
+- **Manual dispatch** — test, build, and upload the unsigned build. Asking for a release or an AMO submission also signs (unlisted unless submitting listed), which only a `v*` tag may do. `dry-run` checks the store keys instead
 - When `chrome-enabled` is true, releases include both Firefox `.xpi` and Chrome `.zip` assets
 
 ## Versioning This Repo
 
-This repo uses a **floating major-version tag** (`v1`) following the GitHub Actions convention:
-
-- Callers pin to `@v1` and automatically get patch fixes
-- Callers can pin to `@v1.0.0` for a locked version
-- When releasing a patch, move the `v1` tag forward to the new commit
+Releases are tagged `vX.Y.Z`, and a floating major-version tag (`v1`) follows the latest. Callers pin the release's
+commit SHA rather than either tag, and Dependabot proposes the next one.
 
 ## License
 

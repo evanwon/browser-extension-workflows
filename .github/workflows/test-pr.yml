@@ -26,13 +26,17 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
 
     - name: Setup Node.js
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
       with:
         node-version: '22'
         cache: 'npm'
@@ -61,16 +65,31 @@ jobs:
           echo "::warning::Security vulnerabilities found! Run 'npm audit' locally for details."
         }
 
+    - name: Run tests with coverage
+      run: npm run test:ci
+
+    # The web-ext that build-release lints and signs with, from this workflow's own commit
+    - name: Checkout build tools
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        repository: ${{ job.workflow_repository }}
+        ref: ${{ job.workflow_sha }}
+        path: .release-tools
+        sparse-checkout: release-tools
+        persist-credentials: false
+
+    - name: Install build tools
+      run: |
+        npm ci --ignore-scripts --no-audit --no-fund --prefix .release-tools/release-tools/web-ext
+        echo "$PWD/.release-tools/release-tools/web-ext/node_modules/.bin" >> "$GITHUB_PATH"
+
     - name: Run linting
       run: |
         if [ "${{ inputs.lint-warnings-as-errors }}" == "true" ]; then
-          npx web-ext lint --source-dir=src --warnings-as-errors
+          web-ext lint --source-dir=src --warnings-as-errors
         else
-          npx web-ext lint --source-dir=src
+          web-ext lint --source-dir=src
         fi
-
-    - name: Run tests with coverage
-      run: npm run test:ci
 
     - name: Chrome - Build extension
       if: inputs.chrome-enabled
@@ -89,7 +108,7 @@ jobs:
 
     - name: Upload coverage reports
       if: inputs.upload-coverage
-      uses: codecov/codecov-action@v3
+      uses: codecov/codecov-action@ab904c41d6ece82784817410c45d8b8c02684457 # v3.1.6
       with:
         file: ./coverage/lcov.info
         flags: unittests
